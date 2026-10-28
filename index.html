@@ -370,37 +370,18 @@ import * as pdfjsLib from "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.3.289
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.3.289/pdf.worker.min.mjs";
 
-/* ---------------------------------------------------------------------
- * Field-extraction logic for a Winter Walking "Sales Order" PDF.
- *
- * Words are grouped into visual rows by y-position, then fields are
- * picked out by regex on each row's text, and by x-position for the two
- * places that need column awareness (separating the Bill To / Ship To
- * columns, and reading the line-item table). This mirrors the desktop
- * Python version field-for-field; the row/column logic was validated
- * against real extracted word positions before being wired up here.
- * ------------------------------------------------------------------- */
-
 const ROW_TOLERANCE = 2.0;
 const RIGHT_COL_X0 = 230.0;
 
 class OrderParseError extends Error {}
 
 function smartTitle(text) {
-  // Capitalize each run of letters/digits independently (punctuation glued
-  // directly to a word -- slashes, hyphens -- doesn't merge it into the
-  // previous word's casing): "ELLIOTT/BILLY SHEAN" -> "Elliott/Billy Shean".
   return text.replace(/[A-Za-z0-9]+/g, (w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
 }
 
 const UNIT_LINE_RE = /^(?:suite|ste|unit|apt|apartment)\b|^#/i;
 
 function splitAddressLines(lines) {
-  // Split the Ship To block's street line(s) into a primary address and a
-  // suite/unit line, regardless of which order they're printed in: a line
-  // starting with Suite/Ste/Unit/Apt/# always goes to the second slot, e.g.
-  // ["320 S. Rock Blvd.", "Suite 170"] and ["STE 600", "2301 N BENDIX DRIVE"]
-  // both come out as ["<street>", "<suite>"].
   let unitLines = lines.filter((l) => UNIT_LINE_RE.test(l.trim()));
   let otherLines = lines.filter((l) => !UNIT_LINE_RE.test(l.trim()));
   if (otherLines.length === 0) {
@@ -456,14 +437,14 @@ function parseSalesOrder(pagesWords) {
   {
     const { text } = findRow(rows, /Sales\s+Order\s+No\.?:/);
     const m = text && text.match(/Sales\s+Order\s+No\.?:\s*(\S+)/);
-    if (!m) throw new OrderParseError("Could not find “Sales Order No.” on this PDF.");
+    if (!m) throw new OrderParseError("Could not find Sales Order No. on this PDF.");
     result.salesOrderNo = m[1];
   }
 
   {
     const { text } = findRow(rows, /Sales\s+Order\s+Date:/);
     const m = text && text.match(/Sales\s+Order\s+Date:\s*(\d{1,2}\/\d{1,2}\/\d{4})/);
-    if (!m) throw new OrderParseError("Could not find “Sales Order Date” on this PDF.");
+    if (!m) throw new OrderParseError("Could not find Sales Order Date on this PDF.");
     result.salesOrderDate = m[1];
   }
 
@@ -474,7 +455,7 @@ function parseSalesOrder(pagesWords) {
   }
 
   const { row: shipHeaderRow } = findRow(rows, /Ship\s+To:/);
-  if (!shipHeaderRow) throw new OrderParseError("Could not find the “Ship To:” section on this PDF.");
+  if (!shipHeaderRow) throw new OrderParseError("Could not find the Ship To section on this PDF.");
   const shipRows = rows.filter((r) => r.top > shipHeaderRow.top + ROW_TOLERANCE);
 
   const cszPattern = /^(.*\S)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/;
@@ -487,16 +468,13 @@ function parseSalesOrder(pagesWords) {
     if (!text) continue;
     if (foundCsz) {
       countryLine = text;
-      break; // one line past city/state/zip is the country; stop there
+      break;
     }
     rawLines.push(text);
     if (cszPattern.test(text)) foundCsz = true;
     if (rawLines.length >= 8) break;
   }
 
-  // An "Attn: <name>" line can appear anywhere in the block (typically
-  // right after the company line). Pull it out before working out which
-  // remaining line is the company vs. the street address.
   let attnName = null;
   const shipLines = [];
   for (const line of rawLines) {
@@ -510,7 +488,7 @@ function parseSalesOrder(pagesWords) {
 
   const cszIndex = shipLines.findIndex((l) => cszPattern.test(l));
   if (cszIndex < 1) {
-    throw new OrderParseError("Could not read the full “Ship To” address block on this PDF.");
+    throw new OrderParseError("Could not read the full Ship To address block on this PDF.");
   }
   const companyLine = shipLines[0];
   const streetLines = shipLines.slice(1, cszIndex);
@@ -525,9 +503,6 @@ function parseSalesOrder(pagesWords) {
   result.shippingZip = cszMatch[3];
   result.country = countryLine || null;
 
-  // An "Attn: <name>" line under Ship To takes priority over the separate
-  // Contact Name field elsewhere on the form; fall back to that field when
-  // there's no Attn line.
   if (attnName) {
     result.contactName = smartTitle(attnName);
   } else {
@@ -558,12 +533,6 @@ function parseSalesOrder(pagesWords) {
     result.shippingMethod = method ? smartTitle(method) : null;
   }
 
-  // Remarks -> Gift Note. Shares a row with the "Total $..." line near the
-  // bottom of the form (e.g. "Remarks: FedEx# 903797991 Total $518.00");
-  // pulled out with a non-greedy match up to "Total" so it also comes out
-  // blank when there's nothing written there. Passed through as-is (just
-  // trimmed) -- this is free-text, not a name/address, so it isn't run
-  // through smartTitle.
   {
     const { text } = findRow(rows, /Remarks:/);
     const m = text && text.match(/Remarks:\s*(.*?)\s*Total\s*\$/);
@@ -604,8 +573,6 @@ function parseSalesOrder(pagesWords) {
   return result;
 }
 
-/* --- pdf.js glue: turn text-content items into {text, x0, top} words --- */
-
 function itemToWords(item, pageHeight) {
   const str = item.str;
   if (!str || !str.trim()) return [];
@@ -618,8 +585,6 @@ function itemToWords(item, pageHeight) {
     return [{ text: trimmed, x0, top }];
   }
 
-  // A single text run can bundle more than one word; split it and place
-  // each word proportionally across the run's rendered width.
   const width = item.width || 0;
   const totalLen = str.length || 1;
   const parts = str.split(/(\s+)/);
@@ -640,7 +605,7 @@ async function extractPagesWords(arrayBuffer) {
   const pagesWords = [];
   for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
     const page = await pdf.getPage(pageNum);
-    const view = page.view; // [x0, y0, x1, y1]
+    const view = page.view;
     const pageHeight = view[3] - view[1];
     const textContent = await page.getTextContent();
     const words = [];
@@ -652,12 +617,6 @@ async function extractPagesWords(arrayBuffer) {
   return pagesWords;
 }
 
-/* --- order-upload CSV format: one row per line item. Order Number repeats
- * on every row; the rest of the order-level fields are filled in only on
- * the first row of each order. --- */
-
-// Country text as it appears on the PDF -> the display name the upload
-// system expects. Anything not listed here passes through unchanged.
 const COUNTRY_DISPLAY_NAMES = {
   USA: "US",
 };
@@ -687,8 +646,6 @@ const CSV_HEADERS = [
 ];
 
 function splitContactName(fullName) {
-  // Two names joined by "/" (an Attn line naming two people, e.g. "Marcy
-  // Elliott/Billy Shean") go one whole name per field, not split at a space.
   if (!fullName) return ["", ""];
   const trimmed = fullName.trim();
   const slashIdx = trimmed.indexOf("/");
@@ -707,6 +664,14 @@ function csvEscape(v) {
   return s;
 }
 
+function buildAddress(order) {
+  const street = order.shippingStreet || "";
+  const ref = order.customerRefNo;
+  if (!ref || ref.trim().toUpperCase().startsWith("CC")) return street;
+  const prefix = "PO No. " + ref;
+  return prefix + (street ? ", " + street : "");
+}
+
 function orderToRows(order) {
   const [firstName, lastName] = splitContactName(order.contactName);
   const orderNumber = order.salesOrderNo || "";
@@ -715,7 +680,7 @@ function orderToRows(order) {
     "Order Date": order.salesOrderDate || "",
     "First Name (Required)": firstName,
     "Last name": lastName,
-    "Address": order.shippingStreet || "",
+    "Address": buildAddress(order),
     "Address 2": order.shippingStreet2 || "",
     "City (Required)": order.shippingCity || "",
     "State / Province": order.shippingState || "",
@@ -753,7 +718,7 @@ function fieldRowsForDisplay(order) {
     ["Order Date", order.salesOrderDate],
     ["First Name", firstName],
     ["Last Name", lastName],
-    ["Address", order.shippingStreet],
+    ["Address", buildAddress(order)],
     ["Address 2", order.shippingStreet2],
     ["City", order.shippingCity],
     ["State / Province", order.shippingState],
@@ -769,8 +734,6 @@ function fieldRowsForDisplay(order) {
   });
   return rows;
 }
-
-/* --- UI wiring --- */
 
 const dropEl = document.getElementById("drop");
 const fileInput = document.getElementById("file-input");
@@ -872,7 +835,7 @@ document.getElementById("form").addEventListener("submit", async (e) => {
   resultEl.classList.remove("show");
 
   if (!/\.pdf$/i.test(chosenFile.name) && chosenFile.type !== "application/pdf") {
-    setStatus("error", "“" + chosenFile.name + "” doesn’t look like a PDF — choose the Sales Order PDF file instead.");
+    setStatus("error", chosenFile.name + " doesn't look like a PDF — choose the Sales Order PDF file instead.");
     convertBtn.disabled = false;
     return;
   }
